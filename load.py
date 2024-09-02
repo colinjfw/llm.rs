@@ -1,12 +1,10 @@
-import math
-import inspect
 import os
 import json
 import pathlib
 import os
 from dataclasses import dataclass
 import struct
-from typing import Any, Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -33,66 +31,9 @@ class RMSNorm(torch.nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
     def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        pass
 
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cos = torch.cos(freqs)  # real part
-    freqs_sin = torch.sin(freqs)  # imaginary part
-    return freqs_cos, freqs_sin
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(shape)
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cos: torch.Tensor,
-    freqs_sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-
-    # reshape xq and xk to match the complex representation
-    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
-    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
-
-    # reshape freqs_cos and freqs_sin for broadcasting
-    freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
-    freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
-
-    # apply rotation using real numbers
-    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
-    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
-    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
-    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
-
-    # flatten last two dimensions
-    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
-    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
-
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -112,59 +53,13 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
 
-        # use flash attention or a manual implementation?
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
-            mask = torch.triu(mask, diagonal=1)
-            self.register_buffer("mask", mask)
-
     def forward(
         self,
         x: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
     ):
-        bsz, seqlen, _ = x.shape
-
-        # QKV
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        # RoPE relative positional embeddings
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
-
-        # grouped multiquery attention: expand out keys and values
-        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-
-        # make heads into a batch dimension
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = xk.transpose(1, 2)
-        xv = xv.transpose(1, 2)
-
-        # flash implementation
-        if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
-        else:
-            # manual implementation
-            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-            assert hasattr(self, 'mask')
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores = self.attn_dropout(scores)
-            output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
-
-        # restore time as batch dimension and concat heads
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-
-        # final projection into the residual stream
-        output = self.wo(output)
-        output = self.resid_dropout(output)
-        return output
+        pass
 
 
 class FeedForward(nn.Module):
@@ -180,7 +75,7 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        pass
 
 
 class TransformerBlock(nn.Module):
@@ -201,9 +96,7 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x, freqs_cos, freqs_sin):
-        h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
-        return out
+        pass
 
 
 class Transformer(nn.Module):
@@ -225,21 +118,6 @@ class Transformer(nn.Module):
 
         # share the unembedding parameters with the embedding parameters
         self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
-
-        # some useful precompute for the RoPE relative positional embeddings
-        freqs_cos, freqs_sin = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len)
-        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
-        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
-
-        # init all weights
-        self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
-
-        # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
-        self.last_loss = None
 
 
 def load_meta_model(model_path):
@@ -308,17 +186,20 @@ def load_meta_model(model_path):
     model.eval()
     return model
 
+
 def serialize_fp32(file, tensor):
     """ writes one fp32 tensor to file that is open in wb mode """
     d = tensor.detach().cpu().view(-1).to(torch.float32).numpy()
     b = struct.pack(f'{len(d)}f', *d)
     file.write(b)
 
+
 def serialize_int8(file, tensor):
     """ writes one int8 tensor to file that is open in wb mode """
     d = tensor.detach().cpu().view(-1).numpy().astype(np.int8)
     b = struct.pack(f'{len(d)}b', *d)
     file.write(b)
+
 
 def quantize_q80(w, group_size):
     """
@@ -346,6 +227,7 @@ def quantize_q80(w, group_size):
     maxerr = err.max().item()
     return int8val, scale, maxerr
 
+
 def serialize(file, tensor, format='fp32', name=''):
     print(f'serializing {name}')
     if format == 'fp32':
@@ -356,6 +238,7 @@ def serialize(file, tensor, format='fp32', name=''):
         serialize_int8(file, q) # save the tensor in int8
         serialize_fp32(file, s) # save scale factors
         print(f"quantized {tuple(tensor.shape)} to Q8_0 with max error {err}")
+
 
 def export_model(model, filepath):
     """ Original export of llama2.c bin files, i.e. version v0 """
@@ -391,11 +274,7 @@ def export_model(model, filepath):
     out_file.close()
     print(f"wrote {filepath}")
 
-# if __name__ == '__main__':
-#     model = load_meta_model('llama-2-7b')
-#     export_model(model, 'llama-2-7b/exported')
 
-ones = torch.ones(1024)
-q, scale, _ = quantize_q80(ones, 64)
-print(q.shape)
-print(scale.shape)
+if __name__ == '__main__':
+    model = load_meta_model('llama-2-7b')
+    export_model(model, 'llama-2-7b/exported-q')

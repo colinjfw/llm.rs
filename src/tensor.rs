@@ -16,13 +16,13 @@ pub struct Tensor<'t, const N: usize> {
 pub struct TensorQuant<'t, const N: usize> {
     pub shape: [usize; N],
     pub data: &'t [Q],
-    pub scaling_factors: &'t [F],
+    pub sf: &'t [F],
 }
 
 pub struct TensorQuantMut<'t, const N: usize> {
     pub shape: [usize; N],
     pub data: &'t mut [Q],
-    pub scaling_factors: &'t mut [F],
+    pub sf: &'t mut [F],
 }
 
 pub struct TensorMut<'t, const N: usize> {
@@ -40,7 +40,6 @@ pub type TensorMut1D<'t> = TensorMut<'t, 1>;
 pub type TensorMut2D<'t> = TensorMut<'t, 2>;
 
 pub type TensorQuantMut1D<'t> = TensorQuantMut<'t, 1>;
-pub type TensorQuantMut2D<'t> = TensorQuantMut<'t, 2>;
 
 impl<'t, const N: usize> TensorMut<'t, N> {
     pub fn freeze(&'t self) -> Tensor<'t, N> {
@@ -64,7 +63,7 @@ impl<'t, const N: usize> TensorQuantMut<'t, N> {
         TensorQuant {
             shape: self.shape,
             data: &*self.data,
-            scaling_factors: &*self.scaling_factors,
+            sf: &*self.sf,
         }
     }
 }
@@ -106,6 +105,51 @@ impl<'t, const N: usize> Deref for TensorMut<'t, N> {
 impl<'t, const N: usize> DerefMut for TensorMut<'t, N> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.data
+    }
+}
+
+impl<'t, const N: usize> From<TensorMut<'t, N>> for Tensor<'t, N> {
+    fn from(tensor: TensorMut<'t, N>) -> Self {
+        Tensor {
+            shape: tensor.shape,
+            data: tensor.data,
+        }
+    }
+}
+
+#[inline(always)]
+pub fn quantize(out: &mut TensorQuantMut1D, from: Tensor1D) {
+    const Q_MAX: f32 = 127.0;
+
+    let num_groups = from.len() / GS;
+
+    for group in 0..num_groups {
+        // Find the max absolute value in the current group
+        let mut wmax = 0.0;
+        for i in 0..GS {
+            let val = from[group * GS + i].abs();
+            if val > wmax {
+                wmax = val;
+            }
+        }
+
+        // Calculate and write the scaling factor
+        let scale = wmax / Q_MAX;
+        out.sf[group] = scale;
+
+        // Calculate and write the quantized values
+        for i in 0..GS {
+            let quant_value = from[group * GS + i] / scale; // scale
+            let quantized = (quant_value.round() as i8).clamp(-128, 127); // round and clamp
+            out.data[group * GS + i] = quantized;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn dequantize<const N: usize>(out: &mut TensorMut<N>, from: TensorQuant<N>) {
+    for i in 0..from.data.len() {
+        out[i] = (from.data[i] as F) * from.sf[i / GS];
     }
 }
 
