@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import struct
 from typing import Optional
 
+import sentencepiece
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -274,7 +275,31 @@ def export_model(model, filepath):
     out_file.close()
     print(f"wrote {filepath}")
 
+def export_tokens(model_path):
+    model = sentencepiece.SentencePieceProcessor(model_file=model_path)
+
+    bos_id = model.bos_id()
+    eos_id = model.eos_id()
+    # pad_id = model.pad_id()
+
+    tokenizer_bin = model_path.replace('.model', '.bin')
+    with open(tokenizer_bin, 'wb') as f:
+        for i in range(model.vocab_size()):
+            t = model.id_to_piece(i)
+            if i == bos_id:
+                t = '\n<s>\n'
+            elif i == eos_id:
+                t = '\n</s>\n'
+            t = t.replace('▁', ' ') # sentencepiece uses this character as whitespace
+
+            b = t.encode('utf-8') # bytes of this token, utf-8 encoded
+            assert len(b) < 256
+
+            f.write(struct.pack('B', len(b)))
+            f.write(b)
+
 
 if __name__ == '__main__':
-    model = load_meta_model('llama-2-7b')
-    export_model(model, 'llama-2-7b/exported-q')
+    # model = load_meta_model('llama-2-7b')
+    # export_model(model, 'llama-2-7b/exported-q')
+    export_tokens('./llama-2-7b/tokenizer.model')

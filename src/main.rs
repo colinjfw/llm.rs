@@ -1,17 +1,20 @@
-use std::{env::args, fs, os::fd::AsRawFd, ptr, slice};
+use std::{env::args, fs, io::Read, os::fd::AsRawFd, ptr, slice};
 
 mod model;
 mod tensor;
 mod tokenizer;
 
 pub fn main() {
-    let filepath = args().nth(1).expect("must provide filepath");
-    println!("reading {filepath}...");
+    let mut args = args();
 
-    let file = fs::File::open(filepath).expect("could not open file");
-    let metadata = file.metadata().expect("could not read file");
+    let weight_file = args.nth(1).expect("must provide weight file");
+    let token_file = args.next().expect("must provide token file");
 
+    println!("reading weights from {weight_file}...");
     let weights = unsafe {
+        let file = fs::File::open(weight_file).expect("could not open file");
+        let metadata = file.metadata().expect("could not read file");
+
         let len = metadata.len() as usize;
         let ptr = libc::mmap(
             ptr::null_mut(),
@@ -56,10 +59,21 @@ pub fn main() {
         alloc.len() / (1024 * 1024 * 1024)
     );
 
-    let tokenizer = tokenizer::Tokenizer {};
+    println!("reading tokens from {token_file}...");
+    let mut vocab = vec![""; params.vocab_size];
+    let mut tokens = Vec::new();
+    {
+        let mut file = fs::File::open(token_file).expect("could not open file");
+        file.read_to_end(&mut tokens).expect("could not read file");
+    }
+    println!(
+        "allocated {}GiB tokens",
+        tokens.len() / (1024 * 1024 * 1024)
+    );
 
+    let tokenizer = tokenizer::Tokenizer::new(&params, &mut vocab, &tokens);
     let mut model = model::Model::new(params, tokenizer, &weights[header_size..], &mut alloc);
     println!("model built: {params:#?}");
 
-    model.generate("tell me a story");
+    model.generate();
 }

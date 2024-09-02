@@ -1,34 +1,29 @@
-use std::io;
-
 use crate::model::ModelParams;
 
-pub struct Tokenizer {}
+pub struct Tokenizer<'t> {
+    vocab: &'t [&'t str],
+}
 
-impl Tokenizer {
+impl<'t> Tokenizer<'t> {
     pub const BOS: usize = 1;
 
-    pub fn new(params: &ModelParams) -> Self {
-        Self {}
+    pub fn new(params: &ModelParams, vocab: &'t mut [&'t str], tokens: &'t [u8]) -> Self {
+        let mut pos = 0;
+        for i in 0..params.vocab_size {
+            let len = tokens[pos] as usize;
+            let str = std::str::from_utf8(&tokens[pos + 1..pos + 1 + len]).unwrap();
+            vocab[i] = str;
+            pos += len + 1;
+        }
+
+        Self { vocab }
     }
 
-    pub fn encode<'s>(&self, s: &'s str) -> Encode<'s> {
-        Encode { i: 0, str: s }
-    }
-
-    pub fn decode(&self, prev: usize, next: usize, f: &mut impl io::Write) {
-        todo!()
-    }
-}
-
-pub struct Encode<'s> {
-    i: usize,
-    str: &'s str,
-}
-
-impl<'s> Iterator for Encode<'s> {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+    pub fn decode(&self, prev: usize, next: usize) -> &str {
+        let mut piece = self.vocab[next];
+        if prev == Self::BOS && piece == " " {
+            piece = self.vocab[next + 1];
+        }
+        piece
     }
 }

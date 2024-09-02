@@ -1,7 +1,6 @@
 //! Inference for Llama-2 Transformer model in pure Rust
 
 use core::mem::MaybeUninit;
-use std::io;
 
 use crate::{tensor::*, tokenizer::Tokenizer};
 
@@ -62,7 +61,7 @@ struct Weights<'m> {
 }
 
 pub struct Model<'m> {
-    tokenizer: Tokenizer,
+    tokenizer: Tokenizer<'m>,
     params: ModelParams,
     weights: Weights<'m>,
     buffers: Buffers<'m>,
@@ -155,27 +154,19 @@ fn sample(logits: Tensor1D) -> usize {
     todo!()
 }
 
-fn generate(model: &mut Model, prompt: &str, steps: usize) {
-    let mut prompt = model.tokenizer.encode(prompt).fuse();
+fn generate(model: &mut Model, steps: usize) {
     let mut pos = 0;
-    let mut token = prompt
-        .next()
-        .expect("expected at least one token from prompt");
-
-    let mut out = io::stdout().lock();
+    let mut token = 0;
 
     while pos < steps {
         forward(model, token, pos);
 
-        let next = match prompt.next() {
-            Some(next) => next,
-            None => sample(model.buffers.logits.freeze()),
-        };
+        let next = sample(model.buffers.logits.freeze());
         if next == Tokenizer::BOS {
             return;
         }
 
-        model.tokenizer.decode(token, next, &mut out);
+        print!("{}", model.tokenizer.decode(token, next));
 
         token = next;
         pos += 1;
@@ -361,7 +352,7 @@ impl ModelParams {
 impl<'m> Model<'m> {
     pub fn new(
         params: ModelParams,
-        tokenizer: Tokenizer,
+        tokenizer: Tokenizer<'m>,
         mut weights: &'m [u8],
         mut alloc: &'m mut [u8],
     ) -> Self {
@@ -490,7 +481,7 @@ impl<'m> Model<'m> {
         }
     }
 
-    pub fn generate(&mut self, prompt: &str) {
-        generate(self, prompt, 5)
+    pub fn generate(&mut self) {
+        generate(self, 100)
     }
 }
