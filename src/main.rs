@@ -1,8 +1,8 @@
 // Inference for Llama-2 Transformer model in pure Rust
 
-use std::{env::args, fs, io::Read, mem::MaybeUninit};
+use std::{env::args, fs, io::Read, mem::MaybeUninit, os::fd::AsRawFd, ptr, slice};
 
-use tensor::{Tensor, Tensor1D, Tensor2D, TensorMut, TensorMut1D, TensorMut2D, F};
+use tensor::*;
 
 mod tensor;
 
@@ -19,13 +19,14 @@ struct ModelParams {
     seq_len: usize,    // max sequence length
 }
 
-#[derive(Debug)]
 struct Buffers<'m> {
     x: TensorMut1D<'m>,         // (dim)
     xb: TensorMut1D<'m>,        // (dim)
     xb2: TensorMut1D<'m>,       // (dim)
+    xq: TensorQuantMut1D<'m>,   // (dim)
     hb: TensorMut1D<'m>,        // (hidden_dim)
     hb2: TensorMut1D<'m>,       // (hidden_dim)
+    hq: TensorQuantMut1D<'m>,   // (hidden_dim)
     q: TensorMut1D<'m>,         // (dim)
     att: TensorMut2D<'m>,       // (n_heads, seq_len)
     logits: TensorMut1D<'m>,    // (vocab_size)
@@ -33,34 +34,32 @@ struct Buffers<'m> {
     val_cache: TensorMut1D<'m>, // (layer * seq_len * dim)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Layer<'l> {
     rms_att_weight: Tensor1D<'l>, // (dim)
     rms_ffn_weight: Tensor1D<'l>, // (dim)
     // matmuls
     /// (dim, heads * head_size)
-    wq: Tensor2D<'l>,
+    wq: TensorQuant2D<'l>,
     /// (dim, n_kv_heads * head_size)
-    wk: Tensor2D<'l>,
+    wk: TensorQuant2D<'l>,
     /// (dim, n_kv_heads * head_size)
-    wv: Tensor2D<'l>,
+    wv: TensorQuant2D<'l>,
     /// (n_heads * head_size, dim)
-    wo: Tensor2D<'l>,
+    wo: TensorQuant2D<'l>,
     // weights for ffn
-    w1: Tensor2D<'l>, // (hidden_dim, dim)
-    w2: Tensor2D<'l>, // (dim, hidden_dim)
-    w3: Tensor2D<'l>, // (hidden_dim, dim)
+    w1: TensorQuant2D<'l>, // (hidden_dim, dim)
+    w2: TensorQuant2D<'l>, // (dim, hidden_dim)
+    w3: TensorQuant2D<'l>, // (hidden_dim, dim)
 }
 
-#[derive(Debug)]
 struct Weights<'m> {
-    token_embedding_table: Tensor2D<'m>, // (vocab_size, dim)
-    rms_final_weight: Tensor1D<'m>,      // (dim,)
-    wcls: Tensor2D<'m>,                  // (vocab_size, dim)
+    token_embedding_table: TensorQuant2D<'m>, // (vocab_size, dim)
+    rms_final_weight: TensorQuant1D<'m>,      // (dim,)
+    wcls: TensorQuant2D<'m>,                  // (vocab_size, dim)
     layers: [MaybeUninit<Layer<'m>>; L],
 }
 
-#[derive(Debug)]
 struct Model<'m> {
     params: ModelParams,
     weights: Weights<'m>,
@@ -122,20 +121,23 @@ fn softmax(x: &mut [f32]) {
     }
 }
 
+#[inline(always)]
+fn quantize(out: &mut TensorQuantMut1D, from: Tensor1D) {}
+
 /// W (d,n) @ x (n,) -> xout (d,)
 #[inline(always)]
-fn matmul(out: &mut TensorMut1D, w: Tensor2D, x: Tensor1D) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    let (d, n) = (w.shape[0], w.shape[1]);
-    assert_eq!(x.shape[0], n);
+fn matmul(out: &mut TensorMut1D, w: TensorQuant2D, x: TensorQuant1D) {
+    // // W (d,n) @ x (n,) -> xout (d,)
+    // let (d, n) = (w.shape[0], w.shape[1]);
+    // assert_eq!(x.shape[0], n);
 
-    for i in 0..d {
-        let mut val = 0.0;
-        for j in 0..n {
-            val += w[i * n + j] * x[j];
-        }
-        out[i] = val;
-    }
+    // for i in 0..d {
+    //     let mut val = 0.0;
+    //     for j in 0..n {
+    //         val += w[i * n + j] * x[j];
+    //     }
+    //     out[i] = val;
+    // }
 }
 
 fn forward(model: &mut Model, token: usize, pos: usize) {
@@ -145,6 +147,8 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
     let x = &mut model.buffers.x;
     let xb = &mut model.buffers.xb;
     let xb2 = &mut model.buffers.xb2;
+    let xq = &mut model.buffers.xq;
+    let hq = &mut model.buffers.hq;
     let q = &mut model.buffers.q;
     let att = &mut model.buffers.att;
     let hb = &mut model.buffers.hb;
@@ -159,8 +163,8 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
     let hidden_dim = p.hidden_dim;
     let head_size = dim / p.n_heads;
 
-    let content_row = &w.token_embedding_table[token * dim..(token + 1) * dim];
-    x.copy_from_slice(content_row);
+    // let content_row = &w.token_embedding_table[token * dim..(token + 1) * dim];
+    // x.copy_from_slice(content_row);
 
     for l in 0..p.n_layers {
         let layer = unsafe { w.layers[l].assume_init() };
@@ -178,9 +182,10 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
             let v = &mut v;
 
             // qkv matmuls for this position
-            matmul(q, layer.wq, xb.freeze());
-            matmul(k, layer.wk, xb.freeze());
-            matmul(v, layer.wv, xb.freeze());
+            quantize(xq, xb.freeze());
+            matmul(q, layer.wq, xq.freeze());
+            matmul(k, layer.wk, xq.freeze());
+            matmul(v, layer.wv, xq.freeze());
 
             // RoPE relative positional encoding: complex-valued rotate q and k in each head
             for i in (0..dim).step_by(2) {
@@ -235,7 +240,8 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
         }
 
         // final matmul to get the output of the attention
-        matmul(xb2, layer.wo, xb.freeze());
+        quantize(xq, xb.freeze());
+        matmul(xb2, layer.wo, xq.freeze());
 
         // residual connection back into x
         for i in 0..dim {
@@ -247,8 +253,9 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(hb, layer.w1, xb.freeze());
-        matmul(hb2, layer.w3, xb.freeze());
+        quantize(xq, xb.freeze());
+        matmul(hb, layer.w1, xq.freeze());
+        matmul(hb2, layer.w3, xq.freeze());
 
         // SwiGLU non-linearity
         for i in 0..hidden_dim {
@@ -260,7 +267,8 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
         }
 
         // final matmul to get the output of the ffn
-        matmul(xb, layer.w2, hb.freeze());
+        quantize(hq, hb.freeze());
+        matmul(xb, layer.w2, hq.freeze());
 
         // residual connection
         for i in 0..dim {
@@ -269,10 +277,11 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
     }
 
     // final rmsnorm
-    rmsnorm_self(x, w.rms_final_weight);
+    // rmsnorm_self(x, w.rms_final_weight);
 
     // classifier into logits
-    matmul(logits, w.wcls, x.freeze());
+    quantize(xq, x.freeze());
+    matmul(logits, w.wcls, xq.freeze());
 }
 
 impl ModelParams {
@@ -292,46 +301,14 @@ impl ModelParams {
             + (n_heads * seq_len)
             + vocab_size
             + ((n_layers * seq_len * dim) * 2);
-        size_f * size_of::<F>()
-    }
-
-    pub fn weights_size(&self) -> usize {
-        let ModelParams {
-            dim,
-            hidden_dim,
-            n_layers,
-            n_heads,
-            n_kv_heads,
-            vocab_size,
-            ..
-        } = *self;
-
-        let head_size = dim / n_heads;
-        let layer_size = (dim * 2)
-            + (dim * (n_heads * head_size))
-            + ((dim * (n_kv_heads * head_size)) * 2)
-            + ((n_heads * head_size) * dim)
-            + ((hidden_dim * dim) * 3);
-        let size_f = ((vocab_size * dim) * 2) + dim + (layer_size * n_layers);
-        size_f * size_of::<F>()
+        let size_q =
+            dim + ((dim / 64) * size_of::<F>()) + hidden_dim + ((hidden_dim / 64) * size_of::<F>());
+        (size_f * size_of::<F>()) + size_q
     }
 }
 
 impl<'m> Model<'m> {
-    fn new(params: ModelParams, weights: &'m mut [u8], alloc: &'m mut [u8]) -> Self {
-        let mut alloc = {
-            let (head, body, tail) = unsafe { alloc.align_to_mut::<F>() };
-            assert!(head.is_empty());
-            assert!(tail.is_empty());
-            body
-        };
-        let mut weights = {
-            let (head, body, tail) = unsafe { weights.align_to::<F>() };
-            assert!(head.is_empty());
-            assert!(tail.is_empty());
-            body
-        };
-
+    fn new(params: ModelParams, mut weights: &'m [u8], mut alloc: &'m mut [u8]) -> Self {
         let ModelParams {
             dim,
             hidden_dim,
@@ -345,46 +322,78 @@ impl<'m> Model<'m> {
 
         macro_rules! tensor {
             ($shape:expr) => {{
-                let len = $shape.iter().copied().product::<usize>();
+                let len = $shape.iter().copied().product::<usize>() * size_of::<F>();
                 let (data, next) = weights.split_at(len);
                 weights = next;
                 Tensor {
                     shape: $shape,
-                    data: data,
+                    data: casts::to_float(data),
                 }
             }};
         }
 
         macro_rules! tensor_mut {
             ($shape:expr) => {{
-                let len = $shape.iter().copied().product::<usize>();
+                let len = $shape.iter().copied().product::<usize>() * size_of::<F>();
                 let (data, next) = alloc.split_at_mut(len);
                 alloc = next;
                 TensorMut {
                     shape: $shape,
-                    data: data,
+                    data: casts::to_float_mut(data),
+                }
+            }};
+        }
+
+        macro_rules! tensor_quant {
+            ($shape:expr) => {{
+                let data_len = $shape.iter().copied().product::<usize>();
+                let sf_len = (data_len / GS) * size_of::<F>();
+                let len = data_len + sf_len;
+                let (all, next) = weights.split_at(len);
+                let (data, sf) = all.split_at(data_len);
+                weights = next;
+                TensorQuant {
+                    shape: $shape,
+                    data: casts::to_quant(data),
+                    scaling_factors: casts::to_float(sf),
+                }
+            }};
+        }
+
+        macro_rules! tensor_quant_mut {
+            ($shape:expr) => {{
+                let data_len = $shape.iter().copied().product::<usize>();
+                let sf_len = (data_len / GS) * size_of::<F>();
+                let len = data_len + sf_len;
+                let (all, next) = alloc.split_at_mut(len);
+                let (data, sf) = all.split_at_mut(data_len);
+                alloc = next;
+                TensorQuantMut {
+                    shape: $shape,
+                    data: casts::to_quant_mut(data),
+                    scaling_factors: casts::to_float_mut(sf),
                 }
             }};
         }
 
         let mut layers = [const { MaybeUninit::uninit() }; L];
-        let token_embedding_table = tensor!([vocab_size, dim]);
+        let token_embedding_table = tensor_quant!([vocab_size, dim]);
         for i in 0..n_layers {
             let layer = Layer {
                 rms_att_weight: tensor!([dim]),
                 rms_ffn_weight: tensor!([dim]),
-                wq: tensor!([dim, n_heads * head_size]),
-                wk: tensor!([dim, n_kv_heads * head_size]),
-                wv: tensor!([dim, n_kv_heads * head_size]),
-                wo: tensor!([n_heads * head_size, dim]),
-                w1: tensor!([hidden_dim, dim]),
-                w2: tensor!([dim, hidden_dim]),
-                w3: tensor!([hidden_dim, dim]),
+                wq: tensor_quant!([dim, n_heads * head_size]),
+                wk: tensor_quant!([dim, n_kv_heads * head_size]),
+                wv: tensor_quant!([dim, n_kv_heads * head_size]),
+                wo: tensor_quant!([n_heads * head_size, dim]),
+                w1: tensor_quant!([hidden_dim, dim]),
+                w2: tensor_quant!([dim, hidden_dim]),
+                w3: tensor_quant!([hidden_dim, dim]),
             };
             layers[i].write(layer);
         }
-        let rms_final_weight = tensor!([dim]);
-        let wcls = tensor!([vocab_size, dim]);
+        let rms_final_weight = tensor_quant!([dim]);
+        let wcls = tensor_quant!([vocab_size, dim]);
 
         assert!(weights.is_empty(), "leftover weights: {}", weights.len());
         let weights = Weights {
@@ -398,8 +407,10 @@ impl<'m> Model<'m> {
             x: tensor_mut!([dim]),
             xb: tensor_mut!([dim]),
             xb2: tensor_mut!([dim]),
+            xq: tensor_quant_mut!([dim]),
             hb: tensor_mut!([hidden_dim]),
             hb2: tensor_mut!([hidden_dim]),
+            hq: tensor_quant_mut!([hidden_dim]),
             q: tensor_mut!([dim]),
             att: tensor_mut!([n_heads, seq_len]),
             logits: tensor_mut!([vocab_size]),
@@ -418,15 +429,37 @@ impl<'m> Model<'m> {
 
 pub fn main() {
     let filepath = args().nth(1).expect("must provide filepath");
-    let mut file = fs::File::open(filepath).expect("could not open file");
+    println!("reading {filepath}...");
 
+    let file = fs::File::open(filepath).expect("could not open file");
+    let metadata = file.metadata().expect("could not read file");
+
+    let weights = unsafe {
+        let len = metadata.len() as usize;
+        let ptr = libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
+        let ptr = ptr as *const u8;
+        slice::from_raw_parts(ptr, len)
+    };
+    println!(
+        "mmaped {}GiB from weights file",
+        weights.len() / (1024 * 1024 * 1024)
+    );
+
+    let header_size = 8 * size_of::<u32>();
     let params = {
-        let mut params = [0u32; 8];
-        {
-            let (h, buf, t) = unsafe { params.align_to_mut() };
+        let header = &weights[..header_size];
+        let params = {
+            let (h, buf, t) = unsafe { header.align_to::<u32>() };
             assert!(h.is_empty() && t.is_empty());
-            file.read_exact(buf).expect("could not read header");
-        }
+            buf
+        };
 
         assert_eq!(params[0], 12440); // version
         ModelParams {
@@ -439,22 +472,16 @@ pub fn main() {
             seq_len: params[7] as _,
         }
     };
-    println!("model: {params:#?}");
+    println!("read model header");
 
-    let mut weights = vec![0; params.weights_size()];
-    println!(
-        "allocated {}GiB weights",
-        weights.len() / (1024 * 1024 * 1024)
-    );
     let mut alloc = vec![0; params.buffer_size()];
     println!(
         "allocated {}GiB buffers",
         alloc.len() / (1024 * 1024 * 1024)
     );
 
-    file.read_exact(&mut weights)
-        .expect("could not read weights");
+    let mut model = Model::new(params, &weights[header_size..], &mut alloc);
+    println!("model built: {params:#?}");
 
-    let mut model = Model::new(params, &mut weights, &mut alloc);
     forward(&mut model, 0, 0);
 }
