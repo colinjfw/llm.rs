@@ -1,5 +1,4 @@
-use core::ops::{Deref, DerefMut};
-use std::ops::Range;
+use core::ops::{Deref, DerefMut, Range};
 
 pub type F = f32;
 pub type Q = i8;
@@ -46,14 +45,6 @@ impl<'t, const N: usize> TensorMut<'t, N> {
         Tensor {
             shape: self.shape,
             data: &*self.data,
-        }
-    }
-
-    pub fn slice_mut(&mut self, range: Range<usize>) -> TensorMut1D<'_> {
-        let data = &mut self.data[range];
-        TensorMut {
-            shape: [data.len()],
-            data,
         }
     }
 }

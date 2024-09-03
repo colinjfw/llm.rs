@@ -1,6 +1,7 @@
 //! Inference for Llama-2 Transformer model in pure Rust
 
 use core::mem::MaybeUninit;
+use std::io::{self, Write};
 
 use crate::{tensor::*, tokenizer::Tokenizer};
 
@@ -26,6 +27,8 @@ struct Buffers<'m> {
     hb2: TensorMut1D<'m>,                // (hidden_dim)
     hq: TensorQuantMut1D<'m>,            // (hidden_dim)
     q: TensorMut1D<'m>,                  // (dim)
+    k: TensorMut1D<'m>,                  // (dim)
+    v: TensorMut1D<'m>,                  // (dim)
     att: TensorMut2D<'m>,                // (n_heads, seq_len)
     logits: TensorMut1D<'m>,             // (vocab_size)
     key_cache: TensorMut1D<'m>,          // (layer * seq_len * dim)
@@ -72,8 +75,8 @@ pub struct Model<'m> {
 /// rmsnorm(x(s), w(s)) -> o(s)
 #[inline(always)]
 fn rmsnorm(o: &mut TensorMut1D, x: Tensor1D, w: Tensor1D) {
-    assert_eq!(x.shape, w.shape);
-    assert_eq!(x.shape, o.shape);
+    debug_assert_eq!(x.shape, w.shape);
+    debug_assert_eq!(x.shape, o.shape);
 
     let mut ss = 0.0f32;
     for v in x.iter().copied() {
@@ -89,7 +92,7 @@ fn rmsnorm(o: &mut TensorMut1D, x: Tensor1D, w: Tensor1D) {
 
 #[inline(always)]
 fn rmsnorm_self(o: &mut TensorMut1D, w: Tensor1D) {
-    assert_eq!(w.shape, o.shape);
+    debug_assert_eq!(w.shape, o.shape);
 
     let mut ss = 0.0f32;
     for v in o.iter().copied() {
@@ -127,7 +130,7 @@ fn softmax(x: &mut [f32]) {
 fn matmul(out: &mut TensorMut1D, w: TensorQuant2D, x: TensorQuant1D) {
     // // W (d,n) @ x (n,) -> xout (d,)
     let (d, n) = (w.shape[0], w.shape[1]);
-    assert_eq!(x.shape[0], n);
+    debug_assert_eq!(x.shape[0], n);
 
     for i in 0..d {
         let mut val = 0.0;
@@ -151,12 +154,22 @@ fn matmul(out: &mut TensorMut1D, w: TensorQuant2D, x: TensorQuant1D) {
 
 #[inline(always)]
 fn sample(logits: Tensor1D) -> usize {
-    todo!()
+    let mut max_i = 0;
+    let mut max_p = logits[0];
+    for (i, p) in logits.iter().copied().enumerate() {
+        if p > max_p {
+            max_i = i;
+            max_p = p;
+        }
+    }
+    max_i
 }
 
-fn generate(model: &mut Model, steps: usize) {
+fn generate(model: &mut Model, start: usize, steps: usize) {
     let mut pos = 0;
-    let mut token = 0;
+    let mut token = start;
+
+    let mut stdout = io::stdout().lock();
 
     while pos < steps {
         forward(model, token, pos);
@@ -166,7 +179,11 @@ fn generate(model: &mut Model, steps: usize) {
             return;
         }
 
-        print!("{}", model.tokenizer.decode(token, next));
+        let output = model.tokenizer.decode(token, next);
+        stdout
+            .write(output.as_bytes())
+            .expect("error writing to stdout");
+        stdout.flush().expect("error flushing");
 
         token = next;
         pos += 1;
@@ -194,6 +211,8 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
     let xq = &mut model.buffers.xq;
     let hq = &mut model.buffers.hq;
     let q = &mut model.buffers.q;
+    let k = &mut model.buffers.k;
+    let v = &mut model.buffers.v;
     let att = &mut model.buffers.att;
     let hb = &mut model.buffers.hb;
     let hb2 = &mut model.buffers.hb2;
@@ -213,39 +232,34 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
         // attention rmsnorm
         rmsnorm(xb, x.freeze(), layer.rms_att_weight);
 
-        // key and value point to the kv cache
-        let loff = l * seq_len * kv_dim;
-        {
-            let mut k = key_cache.slice_mut(loff + pos * kv_dim..loff + (pos + 1) * kv_dim);
-            let mut v = val_cache.slice_mut(loff + pos * kv_dim..loff + (pos + 1) * kv_dim);
+        // qkv matmuls for this position
+        quantize(xq, xb.freeze());
+        matmul(q, layer.wq, xq.freeze());
+        matmul(k, layer.wk, xq.freeze());
+        matmul(v, layer.wv, xq.freeze());
 
-            let k = &mut k;
-            let v = &mut v;
+        // RoPE relative positional encoding: complex-valued rotate q and k in each head
+        for i in (0..dim).step_by(2) {
+            let head_dim = i % head_size;
+            let freq = 1.0f32 / 10000.0f32.powf(head_dim as f32 / head_size as f32);
+            let val = pos as f32 * freq;
+            let (fcr, fci) = (val.cos(), val.sin());
 
-            // qkv matmuls for this position
-            quantize(xq, xb.freeze());
-            matmul(q, layer.wq, xq.freeze());
-            matmul(k, layer.wk, xq.freeze());
-            matmul(v, layer.wv, xq.freeze());
+            let (v0, v1) = (q[i], q[i + 1]);
+            q[i] = v0 * fcr - v1 * fci;
+            q[i + 1] = v0 * fci + v1 * fcr;
 
-            // RoPE relative positional encoding: complex-valued rotate q and k in each head
-            for i in (0..dim).step_by(2) {
-                let head_dim = i % head_size;
-                let freq = 1.0f32 / 10000.0f32.powf(head_dim as f32 / head_size as f32);
-                let val = pos as f32 * freq;
-                let (fcr, fci) = (val.cos(), val.sin());
-
-                let (v0, v1) = (q[i], q[i + 1]);
-                q[i] = v0 * fcr - v1 * fci;
-                q[i + 1] = v0 * fci + v1 * fcr;
-
-                if i < kv_dim {
-                    let (v0, v1) = (k[i], k[i + 1]);
-                    k[i] = v0 * fcr - v1 * fci;
-                    k[i + 1] = v0 * fci + v1 * fcr;
-                }
+            if i < kv_dim {
+                let (v0, v1) = (k[i], k[i + 1]);
+                k[i] = v0 * fcr - v1 * fci;
+                k[i + 1] = v0 * fci + v1 * fcr;
             }
         }
+
+        // save key,value at this time step (pos) to our kv cache
+        let loff = l * seq_len * kv_dim;
+        key_cache[loff + pos * kv_dim..loff + (pos + 1) * kv_dim].copy_from_slice(&k);
+        val_cache[loff + pos * kv_dim..loff + (pos + 1) * kv_dim].copy_from_slice(&v);
 
         // multihead attention. iterate over all heads
         for h in 0..n_heads {
@@ -268,14 +282,15 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
 
             // weighted sum of the values, store back into xb
             let xb = &mut xb[h * head_size..(h + 1) * head_size];
+            xb.fill(0.0);
             for t in 0..=pos {
                 // get the value vector for this head and at this timestep
                 let v = &val_cache[loff + t * kv_dim + (h / kv_mul) * head_size..];
                 // get the attention weight for this timestep
                 let a = att[t];
                 // accumulate the weighted value into xb
-                for (xb_i, &v_i) in xb.iter_mut().zip(v.iter()) {
-                    *xb_i += a * v_i;
+                for i in 0..head_size {
+                    xb[i] += a * v[i];
                 }
             }
         }
@@ -300,11 +315,12 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
 
         // SwiGLU non-linearity
         for i in 0..hidden_dim {
-            let val = hb[i];
+            let mut val = hb[i];
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            let val = val * (1.0f32 / (1.0f32 + (-val).exp()));
+            val *= (1.0f32 / (1.0f32 + (-val).exp()));
             // elementwise multiply with w3(x)
-            hb[i] = val * hb2[i];
+            val *= hb2[i];
+            hb[i] = val;
         }
 
         // final matmul to get the output of the ffn
@@ -337,7 +353,7 @@ impl ModelParams {
             ..
         } = *self;
 
-        let size_f = (dim * 5)
+        let size_f = (dim * 7)
             + (hidden_dim * 2)
             + (n_heads * seq_len)
             + vocab_size
@@ -442,7 +458,7 @@ impl<'m> Model<'m> {
         let rms_final_weight = tensor_quant!([dim]);
         let wcls = tensor_quant!([vocab_size, dim]);
 
-        assert!(weights.is_empty(), "leftover weights: {}", weights.len());
+        debug_assert!(weights.is_empty(), "leftover weights: {}", weights.len());
         let weights = Weights {
             token_embedding_table,
             rms_final_weight,
@@ -464,6 +480,8 @@ impl<'m> Model<'m> {
             hb2: tensor_mut!([hidden_dim]),
             hq: tensor_quant_mut!([hidden_dim]),
             q: tensor_mut!([dim]),
+            k: tensor_mut!([dim]),
+            v: tensor_mut!([dim]),
             att: tensor_mut!([n_heads, seq_len]),
             logits: tensor_mut!([vocab_size]),
             key_cache: tensor_mut!([n_layers * seq_len * dim]),
@@ -471,7 +489,7 @@ impl<'m> Model<'m> {
             token_embedding_table: token_embedding_table.into(),
             rms_final_weight: rms_final_weight.into(),
         };
-        assert!(alloc.is_empty(), "leftover alloc: {}", alloc.len());
+        debug_assert!(alloc.is_empty(), "leftover alloc: {}", alloc.len());
 
         Self {
             params,
@@ -482,6 +500,6 @@ impl<'m> Model<'m> {
     }
 
     pub fn generate(&mut self) {
-        generate(self, 100)
+        generate(self, 463, 512)
     }
 }

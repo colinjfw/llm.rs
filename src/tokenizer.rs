@@ -1,3 +1,5 @@
+use core::str;
+
 use crate::model::ModelParams;
 
 pub struct Tokenizer<'t> {
@@ -11,7 +13,7 @@ impl<'t> Tokenizer<'t> {
         let mut pos = 0;
         for i in 0..params.vocab_size {
             let len = tokens[pos] as usize;
-            let str = std::str::from_utf8(&tokens[pos + 1..pos + 1 + len]).unwrap();
+            let str = str::from_utf8(&tokens[pos + 1..pos + 1 + len]).unwrap();
             vocab[i] = str;
             pos += len + 1;
         }

@@ -1,5 +1,10 @@
 use std::{env::args, fs, io::Read, os::fd::AsRawFd, ptr, slice};
 
+use std::alloc::System;
+
+#[global_allocator]
+static A: System = System;
+
 mod model;
 mod tensor;
 mod tokenizer;
@@ -66,10 +71,7 @@ pub fn main() {
         let mut file = fs::File::open(token_file).expect("could not open file");
         file.read_to_end(&mut tokens).expect("could not read file");
     }
-    println!(
-        "allocated {}GiB tokens",
-        tokens.len() / (1024 * 1024 * 1024)
-    );
+    println!("allocated {}KiB tokens", tokens.len() / (1024));
 
     let tokenizer = tokenizer::Tokenizer::new(&params, &mut vocab, &tokens);
     let mut model = model::Model::new(params, tokenizer, &weights[header_size..], &mut alloc);

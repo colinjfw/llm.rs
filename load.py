@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import struct
 from typing import Optional
 
+import numpy as np
 import sentencepiece
 import torch
 import torch.nn.functional as F
