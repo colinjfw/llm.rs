@@ -8,6 +8,7 @@ static A: System = System;
 mod model;
 mod tensor;
 mod tokenizer;
+mod parallel;
 
 pub fn main() {
     let mut args = args();

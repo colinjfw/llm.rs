@@ -1,11 +1,17 @@
 //! Inference for Llama-2 Transformer model in pure Rust
 
 use core::mem::MaybeUninit;
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    time::{Duration, Instant},
+};
 
-use crate::{tensor::*, tokenizer::Tokenizer};
+use crate::{parallel::parallel, tensor::*, tokenizer::Tokenizer};
 
-const L: usize = 32;
+const MAX_LAYERS: usize = 32;
+const MAX_HEADS: usize = 32;
+const MAX_SEQ_LEN: usize = 4096;
+const MAX_HEAD_SIZE: usize = MAX_SEQ_LEN / MAX_LAYERS;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ModelParams {
@@ -21,7 +27,6 @@ pub struct ModelParams {
 struct Buffers<'m> {
     x: TensorMut1D<'m>,                  // (dim)
     xb: TensorMut1D<'m>,                 // (dim)
-    xb2: TensorMut1D<'m>,                // (dim)
     xq: TensorQuantMut1D<'m>,            // (dim)
     hb: TensorMut1D<'m>,                 // (hidden_dim)
     hb2: TensorMut1D<'m>,                // (hidden_dim)
@@ -60,7 +65,7 @@ struct Weights<'m> {
     token_embedding_table: TensorQuant2D<'m>, // (vocab_size, dim)
     rms_final_weight: TensorQuant1D<'m>,      // (dim,)
     wcls: TensorQuant2D<'m>,                  // (vocab_size, dim)
-    layers: [MaybeUninit<Layer<'m>>; L],
+    layers: [MaybeUninit<Layer<'m>>; MAX_LAYERS],
 }
 
 pub struct Model<'m> {
@@ -128,7 +133,6 @@ fn softmax(x: &mut [f32]) {
 /// W (d,n) @ x (n,) -> xout (d,)
 #[inline(always)]
 fn matmul(out: &mut TensorMut1D, w: TensorQuant2D, x: TensorQuant1D) {
-    // // W (d,n) @ x (n,) -> xout (d,)
     let (d, n) = (w.shape[0], w.shape[1]);
     debug_assert_eq!(x.shape[0], n);
 
@@ -152,6 +156,100 @@ fn matmul(out: &mut TensorMut1D, w: TensorQuant2D, x: TensorQuant1D) {
     }
 }
 
+// RoPE relative positional encoding: complex-valued rotate q and k in each head
+#[inline(always)]
+fn rope(
+    q: &mut TensorMut1D,
+    k: &mut TensorMut1D,
+    pos: usize,
+    dim: usize,
+    kv_dim: usize,
+    head_size: usize,
+) {
+    for i in (0..dim).step_by(2) {
+        let head_dim = i % head_size;
+        let freq = 1.0f32 / 10000.0f32.powf(head_dim as f32 / head_size as f32);
+        let val = pos as f32 * freq;
+        let (fcr, fci) = (val.cos(), val.sin());
+
+        let (v0, v1) = (q[i], q[i + 1]);
+        q[i] = v0 * fcr - v1 * fci;
+        q[i + 1] = v0 * fci + v1 * fcr;
+
+        if i < kv_dim {
+            let (v0, v1) = (k[i], k[i + 1]);
+            k[i] = v0 * fcr - v1 * fci;
+            k[i + 1] = v0 * fci + v1 * fcr;
+        }
+    }
+}
+
+#[inline(always)]
+fn multihead_attention(
+    key_cache: Tensor1D,
+    val_cache: Tensor1D,
+    q: Tensor1D,
+    xb: &mut TensorMut1D,
+    pos: usize,
+    loff: usize,
+    n_heads: usize,
+    kv_dim: usize,
+    kv_mul: usize,
+    head_size: usize,
+    seq_len: usize,
+) {
+    // on the stack
+    let mut att = TensorMut1D {
+        shape: [seq_len],
+        data: &mut [0.0; MAX_SEQ_LEN][..seq_len],
+    };
+
+    for h in 0..n_heads {
+        // get the query vector for this head
+        let q = &q[h * head_size..(h + 1) * head_size];
+
+        // iterate over all timesteps, including the current one
+        for t in 0..=pos {
+            // get the key vector for this head and at this timestep
+            let k = &key_cache[loff + t * kv_dim + (h / kv_mul) * head_size..];
+            // calculate the attention score as the dot product of q and k
+            let score: f32 = q.iter().zip(k.iter()).map(|(qi, ki)| qi * ki).sum();
+            // save the score to the attention buffer
+            att[t] = score / (head_size as f32).sqrt();
+        }
+
+        // softmax the scores to get attention weights, from 0..pos inclusively
+        softmax(&mut att[0..pos + 1]);
+
+        // weighted sum of the values, store back into xb
+        let xb = &mut xb[h * head_size..(h + 1) * head_size];
+        xb.fill(0.0);
+        for t in 0..=pos {
+            // get the value vector for this head and at this timestep
+            let v = &val_cache[loff + t * kv_dim + (h / kv_mul) * head_size..];
+            // get the attention weight for this timestep
+            let a = att[t];
+            // accumulate the weighted value into xb
+            for i in 0..head_size {
+                xb[i] += a * v[i];
+            }
+        }
+    }
+}
+
+// SwiGLU non-linearity
+#[inline(always)]
+fn swiglu(hb: &mut TensorMut1D, hb2: &mut TensorMut1D, hidden_dim: usize) {
+    for i in 0..hidden_dim {
+        let mut val = hb[i];
+        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+        val *= 1.0f32 / (1.0f32 + (-val).exp());
+        // elementwise multiply with w3(x)
+        val *= hb2[i];
+        hb[i] = val;
+    }
+}
+
 #[inline(always)]
 fn sample(logits: Tensor1D) -> usize {
     let mut max_i = 0;
@@ -170,6 +268,7 @@ fn generate(model: &mut Model, start: usize, steps: usize) {
     let mut token = start;
 
     let mut stdout = io::stdout().lock();
+    let start = Instant::now();
 
     while pos < steps {
         forward(model, token, pos);
@@ -188,6 +287,10 @@ fn generate(model: &mut Model, start: usize, steps: usize) {
         token = next;
         pos += 1;
     }
+
+    let elapsed = start.elapsed();
+    let elapsed_per_token = Duration::from_micros(elapsed.as_micros() as u64 / steps as u64);
+    println!("\n\ngenerated {steps} tokens in {elapsed:?}, {elapsed_per_token:?} per token");
 }
 
 fn forward(model: &mut Model, token: usize, pos: usize) {
@@ -202,25 +305,25 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
     } = model.params;
     let kv_dim = (dim * n_kv_heads) / n_heads;
     let kv_mul = n_heads / n_kv_heads;
-    let hidden_dim = hidden_dim;
     let head_size = dim / n_heads;
 
-    let x = &mut model.buffers.x;
-    let xb = &mut model.buffers.xb;
-    let xb2 = &mut model.buffers.xb2;
-    let xq = &mut model.buffers.xq;
-    let hq = &mut model.buffers.hq;
-    let q = &mut model.buffers.q;
-    let k = &mut model.buffers.k;
-    let v = &mut model.buffers.v;
-    let att = &mut model.buffers.att;
-    let hb = &mut model.buffers.hb;
-    let hb2 = &mut model.buffers.hb2;
-    let key_cache = &mut model.buffers.key_cache;
-    let val_cache = &mut model.buffers.val_cache;
-    let logits = &mut model.buffers.logits;
-    let token_embedding_table = model.buffers.token_embedding_table;
-    let rms_final_weight = model.buffers.rms_final_weight;
+    let Buffers {
+        x,
+        xb,
+        xq,
+        hb,
+        hb2,
+        hq,
+        q,
+        k,
+        v,
+        logits,
+        key_cache,
+        val_cache,
+        token_embedding_table,
+        rms_final_weight,
+        ..
+    } = &mut model.buffers;
     let wcls = model.weights.wcls;
 
     let content_row = &token_embedding_table[token * dim..(token + 1) * dim];
@@ -239,22 +342,7 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
         matmul(v, layer.wv, xq.freeze());
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        for i in (0..dim).step_by(2) {
-            let head_dim = i % head_size;
-            let freq = 1.0f32 / 10000.0f32.powf(head_dim as f32 / head_size as f32);
-            let val = pos as f32 * freq;
-            let (fcr, fci) = (val.cos(), val.sin());
-
-            let (v0, v1) = (q[i], q[i + 1]);
-            q[i] = v0 * fcr - v1 * fci;
-            q[i + 1] = v0 * fci + v1 * fcr;
-
-            if i < kv_dim {
-                let (v0, v1) = (k[i], k[i + 1]);
-                k[i] = v0 * fcr - v1 * fci;
-                k[i + 1] = v0 * fci + v1 * fcr;
-            }
-        }
+        rope(q, k, pos, dim, kv_dim, head_size);
 
         // save key,value at this time step (pos) to our kv cache
         let loff = l * seq_len * kv_dim;
@@ -262,46 +350,28 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
         val_cache[loff + pos * kv_dim..loff + (pos + 1) * kv_dim].copy_from_slice(&v);
 
         // multihead attention. iterate over all heads
-        for h in 0..n_heads {
-            // get the query vector for this head
-            let q = &q[h * head_size..(h + 1) * head_size];
-            // attention scores for this head
-            let att = &mut att[h * seq_len..(h + 1) * seq_len];
-            // iterate over all timesteps, including the current one
-            for t in 0..=pos {
-                // get the key vector for this head and at this timestep
-                let k = &key_cache[loff + t * kv_dim + (h / kv_mul) * head_size..];
-                // calculate the attention score as the dot product of q and k
-                let score: f32 = q.iter().zip(k.iter()).map(|(qi, ki)| qi * ki).sum();
-                // save the score to the attention buffer
-                att[t] = score / (head_size as f32).sqrt();
-            }
-
-            // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(&mut att[0..pos + 1]);
-
-            // weighted sum of the values, store back into xb
-            let xb = &mut xb[h * head_size..(h + 1) * head_size];
-            xb.fill(0.0);
-            for t in 0..=pos {
-                // get the value vector for this head and at this timestep
-                let v = &val_cache[loff + t * kv_dim + (h / kv_mul) * head_size..];
-                // get the attention weight for this timestep
-                let a = att[t];
-                // accumulate the weighted value into xb
-                for i in 0..head_size {
-                    xb[i] += a * v[i];
-                }
-            }
-        }
+        multihead_attention(
+            key_cache.freeze(),
+            val_cache.freeze(),
+            q.freeze(),
+            xb,
+            // att,
+            pos,
+            loff,
+            n_heads,
+            kv_dim,
+            kv_mul,
+            head_size,
+            seq_len,
+        );
 
         // final matmul to get the output of the attention
         quantize(xq, xb.freeze());
-        matmul(xb2, layer.wo, xq.freeze());
+        matmul(xb, layer.wo, xq.freeze());
 
         // residual connection back into x
         for i in 0..dim {
-            x[i] += xb2[i];
+            x[i] += xb[i];
         }
 
         // ffn rmsnorm
@@ -314,14 +384,7 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
         matmul(hb2, layer.w3, xq.freeze());
 
         // SwiGLU non-linearity
-        for i in 0..hidden_dim {
-            let mut val = hb[i];
-            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            val *= (1.0f32 / (1.0f32 + (-val).exp()));
-            // elementwise multiply with w3(x)
-            val *= hb2[i];
-            hb[i] = val;
-        }
+        swiglu(hb, hb2, hidden_dim);
 
         // final matmul to get the output of the ffn
         quantize(hq, hb.freeze());
@@ -334,7 +397,7 @@ fn forward(model: &mut Model, token: usize, pos: usize) {
     }
 
     // final rmsnorm
-    rmsnorm_self(x, rms_final_weight);
+    rmsnorm_self(x, *rms_final_weight);
 
     // classifier into logits
     quantize(xq, x.freeze());
@@ -353,7 +416,7 @@ impl ModelParams {
             ..
         } = *self;
 
-        let size_f = (dim * 7)
+        let size_f = (dim * 6)
             + (hidden_dim * 2)
             + (n_heads * seq_len)
             + vocab_size
@@ -439,7 +502,7 @@ impl<'m> Model<'m> {
             }};
         }
 
-        let mut layers = [const { MaybeUninit::uninit() }; L];
+        let mut layers = [const { MaybeUninit::uninit() }; MAX_LAYERS];
         let token_embedding_table = tensor_quant!([vocab_size, dim]);
         for i in 0..n_layers {
             let layer = Layer {
@@ -474,7 +537,6 @@ impl<'m> Model<'m> {
         let buffers = Buffers {
             x: tensor_mut!([dim]),
             xb: tensor_mut!([dim]),
-            xb2: tensor_mut!([dim]),
             xq: tensor_quant_mut!([dim]),
             hb: tensor_mut!([hidden_dim]),
             hb2: tensor_mut!([hidden_dim]),
@@ -500,6 +562,6 @@ impl<'m> Model<'m> {
     }
 
     pub fn generate(&mut self) {
-        generate(self, 463, 512)
+        generate(self, 463, 10)
     }
 }

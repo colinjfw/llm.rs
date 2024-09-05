@@ -1,4 +1,4 @@
-use core::ops::{Deref, DerefMut, Range};
+use core::ops::{Deref, DerefMut};
 
 pub type F = f32;
 pub type Q = i8;
